@@ -12,15 +12,16 @@ export default function ChatPage() {
   const router = useRouter();
   const params = useParams();
   const userId = params.userId as string;
-  
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [otherUser, setOtherUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [isOtherUserTyping, setIsOtherUserTyping] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatId = [user?.id, userId].sort().join('_');
-  const lastMessageCountRef = useRef(0);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const loadMessages = useCallback(async () => {
     try {
@@ -42,10 +43,16 @@ export default function ChatPage() {
 
     fetchOtherUser();
     loadMessages();
-    
-    // Set up Supabase real-time subscription
+
+    // Set up Supabase real-time subscription for messages and presence
     const channel = supabase
-      .channel(`chat:${chatId}`)
+      .channel(`chat:${chatId}`, {
+        config: {
+          presence: {
+            key: user.id,
+          },
+        },
+      })
       .on(
         'postgres_changes',
         {
@@ -61,19 +68,49 @@ export default function ChatPage() {
             text: payload.new.text,
             timestamp: payload.new.created_at,
           };
-          
+
           // Check if message already exists (prevent duplicates)
           setMessages((prev) => {
             const exists = prev.some(msg => msg.id === newMessage.id);
             if (exists) return prev;
             return [...prev, newMessage];
           });
+
+          // Clear typing indicator when message is received
+          setIsOtherUserTyping(false);
         }
       )
-      .subscribe();
-    
+      .on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState();
+
+        // Check if other user is typing
+        Object.keys(state).forEach((presenceKey) => {
+          if (presenceKey !== user.id) {
+            const presences = state[presenceKey] as any[];
+            if (presences && presences.length > 0) {
+              const presenceData = presences[0] as { typing?: boolean; user_id?: string; online_at?: string };
+              const isTyping = presenceData.typing || false;
+              setIsOtherUserTyping(isTyping);
+            }
+          }
+        });
+      })
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          // Track presence
+          await channel.track({
+            user_id: user.id,
+            typing: false,
+            online_at: new Date().toISOString(),
+          });
+        }
+      });
+
     return () => {
       supabase.removeChannel(channel);
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
     };
   }, [user, userId, router, chatId, loadMessages]);
 
@@ -93,6 +130,30 @@ export default function ChatPage() {
     }
   };
 
+  const handleTyping = async () => {
+    // Clear existing timeout
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+
+    // Broadcast typing status
+    const channel = supabase.channel(`chat:${chatId}`);
+    await channel.track({
+      user_id: user?.id,
+      typing: true,
+      online_at: new Date().toISOString(),
+    });
+
+    // Stop typing after 2 seconds of inactivity
+    typingTimeoutRef.current = setTimeout(async () => {
+      await channel.track({
+        user_id: user?.id,
+        typing: false,
+        online_at: new Date().toISOString(),
+      });
+    }, 2000);
+  };
+
   const sendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newMessage.trim() || !user || sending) return;
@@ -101,13 +162,21 @@ export default function ChatPage() {
     setNewMessage('');
     setSending(true);
 
+    // Stop typing indicator
+    const channel = supabase.channel(`chat:${chatId}`);
+    await channel.track({
+      user_id: user.id,
+      typing: false,
+      online_at: new Date().toISOString(),
+    });
+
     try {
       // Save to server - real-time subscription will add it to UI
       const response = await fetch('/api/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          chatId, 
+        body: JSON.stringify({
+          chatId,
           message: {
             senderId: user.id,
             text: messageText,
@@ -165,7 +234,18 @@ export default function ChatPage() {
               />
               <div>
                 <h2 className="font-semibold text-gray-800">{otherUser.name}</h2>
-                <p className="text-xs text-green-600">Online</p>
+                {isOtherUserTyping ? (
+                  <p className="text-xs text-blue-600 flex items-center gap-1">
+                    <span className="animate-pulse">typing</span>
+                    <span className="flex gap-0.5">
+                      <span className="w-1 h-1 bg-blue-600 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                      <span className="w-1 h-1 bg-blue-600 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                      <span className="w-1 h-1 bg-blue-600 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                    </span>
+                  </p>
+                ) : (
+                  <p className="text-xs text-green-600">Online</p>
+                )}
               </div>
             </>
           )}
@@ -190,11 +270,10 @@ export default function ChatPage() {
               className={`flex ${msg.senderId === user.id ? 'justify-end' : 'justify-start'}`}
             >
               <div
-                className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl ${
-                  msg.senderId === user.id
+                className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl ${msg.senderId === user.id
                     ? 'bg-blue-600 text-white'
                     : 'bg-white text-gray-800 border'
-                }`}
+                  }`}
               >
                 <p>{msg.text}</p>
                 <p className={`text-xs mt-1 ${msg.senderId === user.id ? 'text-blue-100' : 'text-gray-500'}`}>
@@ -204,6 +283,18 @@ export default function ChatPage() {
             </div>
           ))
         )}
+
+        {/* Typing indicator */}
+        {isOtherUserTyping && (
+          <div className="flex justify-start">
+            <div className="bg-gray-200 px-4 py-3 rounded-2xl flex items-center gap-1">
+              <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+              <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+              <span className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+            </div>
+          </div>
+        )}
+
         <div ref={messagesEndRef} />
       </div>
 
@@ -212,7 +303,10 @@ export default function ChatPage() {
           <input
             type="text"
             value={newMessage}
-            onChange={(e) => setNewMessage(e.target.value)}
+            onChange={(e) => {
+              setNewMessage(e.target.value);
+              handleTyping();
+            }}
             onKeyPress={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
